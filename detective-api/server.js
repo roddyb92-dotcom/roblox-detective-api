@@ -6,8 +6,7 @@ const app = express();
 app.use(express.json());
 
 const openai = new OpenAI({
-  apiKey: process.env.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
-,
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
 // ─────────────────────────────────────────────
