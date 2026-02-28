@@ -1,20 +1,19 @@
 require('dotenv').config();
 
 const express = require("express");
-const OpenAI = require("openai");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 const crypto = require("crypto");
 
 const app = express();
 app.use(express.json());
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
 // ─────────────────────────────────────────────
 // In-memory store (replace with DB in production)
 // ─────────────────────────────────────────────
-const playerSessions = {}; // { playerId: { seenCases: Set, activeCase: {}, chatHistory: [] } }
+const playerSessions = {}; // { playerId: { seenCases: Set, activeCase: {}, chat: ChatSession } }
 const casePool = {};        // { caseId: caseObject }
 
 // ─────────────────────────────────────────────
@@ -24,17 +23,9 @@ const casePool = {};        // { caseId: caseObject }
 async function generateCase() {
   const seed = Math.floor(Math.random() * 1000000);
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    max_tokens: 1500,
-    messages: [
-      {
-        role: "system",
-        content: "You are a crime writer who creates unique, realistic detective game cases. Always respond with valid JSON only — no markdown, no backticks, no extra text.",
-      },
-      {
-        role: "user",
-        content: `Generate a unique modern crime case (murder, theft, fraud, kidnapping, arson) for a detective interrogation game. Use seed ${seed} for variety.
+  const prompt = `You are a crime writer who creates unique, realistic detective game cases. Always respond with valid JSON only — no markdown, no backticks, no extra text.
+
+Generate a unique modern crime case (murder, theft, fraud, kidnapping, arson) for a detective interrogation game. Use seed ${seed} for variety.
 
 Return ONLY valid JSON in this exact format:
 {
@@ -73,12 +64,10 @@ Return ONLY valid JSON in this exact format:
   "solvingClues": ["clue 1 the detective should find", "clue 2", "clue 3"],
   "crimeLocation": "where the crime happened",
   "timeOfCrime": "time and date"
-}`,
-      },
-    ],
-  });
+}`;
 
-  const text = response.choices[0].message.content;
+  const response = await model.generateContent(prompt);
+  const text = response.response.text();
   const json = text.replace(/```json|```/g, "").trim();
   const caseData = JSON.parse(json);
 
@@ -101,7 +90,7 @@ app.get("/case/new", async (req, res) => {
   if (!playerId) return res.status(400).json({ error: "playerId required" });
 
   if (!playerSessions[playerId]) {
-    playerSessions[playerId] = { seenCases: new Set(), activeCase: null, chatHistory: [] };
+    playerSessions[playerId] = { seenCases: new Set(), activeCase: null, chat: null };
   }
 
   const session = playerSessions[playerId];
@@ -116,7 +105,37 @@ app.get("/case/new", async (req, res) => {
 
     session.seenCases.add(caseData.caseId);
     session.activeCase = caseData;
-    session.chatHistory = [];
+    
+    // Initialize a new chat session for this case
+    const systemPrompt = `You are ${caseData.suspect.name}, a ${caseData.suspect.age}-year-old ${caseData.suspect.occupation} being interrogated by a detective.
+
+CASE FACTS (secret — do not reveal directly):
+- Crime: ${caseData.crimeType} of ${caseData.victim.name} at ${caseData.crimeLocation} on ${caseData.timeOfCrime}
+- You are ${caseData.suspect.isGuilty ? "GUILTY" : "INNOCENT"}
+- Your motive: ${caseData.suspect.motive || "none — you are innocent"}
+- Your alibi: ${caseData.suspect.alibi} (this alibi is ${caseData.suspect.alibiIsTrue ? "TRUE" : "FALSE"})
+- Secret you are hiding: ${caseData.suspect.secretTheyAreHiding}
+
+YOUR BEHAVIOR STYLE: ${caseData.suspect.behaviorStyle}
+- "lies_confidently": You lie smoothly, deny everything, seem very calm and composed
+- "nervous_and_slips": You are anxious, make small contradictions, occasionally let things slip
+- "changes_story": Your story subtly changes when pressured or shown evidence
+- "mostly_truthful_but_hides_one_thing": You answer honestly except about one key detail
+
+YOUR PERSONALITY: ${caseData.suspect.personality}
+
+RULES:
+1. Stay in character at ALL times. You are not an AI, you are this person.
+2. Never confess unless the detective has cornered you with multiple pieces of evidence AND you are guilty.
+3. React realistically when shown evidence.
+4. Keep responses short (2-5 sentences) like a real interrogation.
+5. Show emotion. Sweat. Get angry. Cry. Whatever fits your personality.
+6. Never break character or mention you are an AI.`;
+    
+    session.chat = model.startChat({
+      systemInstruction: systemPrompt,
+      history: []
+    });
 
     // Return only what the player should see (no spoilers)
     res.json({
@@ -153,68 +172,29 @@ app.post("/interrogate", async (req, res) => {
   if (!playerId || !message) return res.status(400).json({ error: "playerId and message required" });
 
   const session = playerSessions[playerId];
-  if (!session || !session.activeCase) {
+  if (!session || !session.activeCase || !session.chat) {
     return res.status(400).json({ error: "No active case. Call /case/new first." });
   }
 
   const c = session.activeCase;
   const suspect = c.suspect;
 
-  let evidenceContext = "";
+  let interrogationMessage = message;
   if (showEvidence) {
     const ev = c.evidence.find(e => e.id === showEvidence);
     if (ev) {
-      evidenceContext = `\n\nThe detective just showed you: "${ev.name}" — ${ev.description}. React appropriately based on whether this implicates you.`;
+      interrogationMessage = `${message}\n\n[Evidence shown: "${ev.name}" — ${ev.description}. React appropriately based on whether this implicates you.]`;
     }
   }
 
-  const systemPrompt = `You are ${suspect.name}, a ${suspect.age}-year-old ${suspect.occupation} being interrogated by a detective.
-
-CASE FACTS (secret — do not reveal directly):
-- Crime: ${c.crimeType} of ${c.victim.name} at ${c.crimeLocation} on ${c.timeOfCrime}
-- You are ${suspect.isGuilty ? "GUILTY" : "INNOCENT"}
-- Your motive: ${suspect.motive || "none — you are innocent"}
-- Your alibi: ${suspect.alibi} (this alibi is ${suspect.alibiIsTrue ? "TRUE" : "FALSE"})
-- Secret you are hiding: ${suspect.secretTheyAreHiding}
-
-YOUR BEHAVIOR STYLE: ${suspect.behaviorStyle}
-- "lies_confidently": You lie smoothly, deny everything, seem very calm and composed
-- "nervous_and_slips": You are anxious, make small contradictions, occasionally let things slip
-- "changes_story": Your story subtly changes when pressured or shown evidence
-- "mostly_truthful_but_hides_one_thing": You answer honestly except about one key detail
-
-YOUR PERSONALITY: ${suspect.personality}
-
-RULES:
-1. Stay in character at ALL times. You are not an AI, you are this person.
-2. Never confess unless the detective has cornered you with multiple pieces of evidence AND you are guilty.
-3. React realistically when shown evidence.
-4. Keep responses short (2-5 sentences) like a real interrogation.
-5. Show emotion. Sweat. Get angry. Cry. Whatever fits your personality.
-6. Never break character or mention you are an AI.${evidenceContext}`;
-
-  // Add user message to chat history
-  session.chatHistory.push({ role: "user", content: message });
-
   try {
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o",
-      max_tokens: 300,
-      messages: [
-        { role: "system", content: systemPrompt },
-        ...session.chatHistory,
-      ],
-    });
-
-    const reply = response.choices[0].message.content;
-
-    // Add assistant reply to history
-    session.chatHistory.push({ role: "assistant", content: reply });
+    const response = await session.chat.sendMessage(interrogationMessage);
+    const reply = response.response.text();
 
     res.json({
       suspectName: suspect.name,
       response: reply,
-      turnCount: session.chatHistory.length / 2,
+      turnCount: (session.chat.getHistory ? session.chat.getHistory().length : 0) / 2,
     });
   } catch (err) {
     console.error(err);
