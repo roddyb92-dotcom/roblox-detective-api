@@ -39,10 +39,15 @@ detective-roblox/
 
 ## Setup Instructions
 
-### Step 1: Deploy the Backend API
+### Step 1: Set Up the Backend API
 
-1. Create a folder, add `server.js` and `package.json`
-2. Set environment variable: `OPENAI_API_KEY=your_key_here`
+1. Copy `detective-api/.env.example` to `detective-api/.env`
+2. Edit `.env` and add your OpenAI key:
+   ```env
+   OPENAI_API_KEY=sk-your-actual-key-here
+   PORT=3000
+   ```
+3. Run `npm install` in the `detective-api/` folder
 3. Deploy to one of:
    - **Railway** (railway.app) — easiest, free tier available
    - **Render** (render.com) — free tier available
